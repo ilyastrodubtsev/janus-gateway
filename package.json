@@ -2,12 +2,23 @@
   "name": "janus-gateway",
   "version": "0.1.0",
   "description": "A javascript library for interacting with the C based Janus WebRTC Server",
-  "main": "html/janus.js",
+  "main": "npm/janus.es.js",
   "files": [
     "html/janus.js",
     "html/janus.nojquery.js",
-    "html/adapter.js"
+    "html/adapter.js",
+    "npm/package.json",
+    "npm/module.js",
+    "npm/rollup.config.js",
+    "npm/janus.es.js"
   ],
+  "scripts": {
+    "prepare": "cd ./npm && npm run rollup -- --o janus.es.js --f es"  
+  },
+  "devDependencies": {
+    "rollup": "^0.50.0",
+    "rollup-plugin-replace": "^2.0.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/meetecho/janus-gateway.git"
