@@ -1055,6 +1055,11 @@ typedef struct janus_streaming_mountpoint {
 	GDestroyNotify source_destroy;
 	janus_streaming_codecs codecs;
 	gboolean audio, video, data;
+
+	uint16_t audiooutport;
+	int audiooutfd;
+	struct sockaddr audiooutaddr;
+
 	GList *viewers;
 	int helper_threads;		/* Only relevant for RTP mountpoints */
 	GList *threads;			/* Only relevant for RTP mountpoints */
@@ -1083,7 +1088,7 @@ static void janus_streaming_helper_rtprtcp_packet(gpointer data, gpointer user_d
 janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		int srtpsuite, char *srtpcrypto, int threads,
-		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint16_t artcpport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
+		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint16_t artcpport, uint16_t artcoutport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
 		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint16_t vrtcpport, uint8_t vcodec, char *vrtpmap, char *vfmtp, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3, gboolean svc, gboolean dovskew, int rtp_collision,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg);
@@ -1401,6 +1406,8 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *threads = janus_config_get_item(cat, "threads");
 				janus_config_item *ssuite = janus_config_get_item(cat, "srtpsuite");
 				janus_config_item *scrypto = janus_config_get_item(cat, "srtpcrypto");
+				janus_config_item *audiooutport = janus_config_get_item(cat, "audiooutport");
+
 				gboolean is_private = priv && priv->value && janus_is_true(priv->value);
 				gboolean doaudio = audio && audio->value && janus_is_true(audio->value);
 				gboolean doaskew = audio && askew && askew->value && janus_is_true(askew->value);
@@ -1530,6 +1537,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						doaudio && aiface && aiface->value ? &audio_iface : NULL,
 						(aport && aport->value) ? atoi(aport->value) : 0,
 						(artcpport && artcpport->value) ? atoi(artcpport->value) : 0,
+						(audiooutport && audiooutport->value) ? atoi(audiooutport->value) : 0,
 						(acodec && acodec->value) ? atoi(acodec->value) : 0,
 						artpmap ? (char *)artpmap->value : NULL,
 						afmtp ? (char *)afmtp->value : NULL,
@@ -2439,7 +2447,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 					ssuite ? json_integer_value(ssuite) : 0,
 					scrypto ? (char *)json_string_value(scrypto) : NULL,
 					threads ? json_integer_value(threads) : 0,
-					doaudio, amcast, &audio_iface, aport, artcpport, acodec, artpmap, afmtp, doaskew,
+					doaudio, amcast, &audio_iface, aport, artcpport, 0, acodec, artpmap, afmtp, doaskew,
 					dovideo, vmcast, &video_iface, vport, vrtcpport, vcodec, vrtpmap, vfmtp, bufferkf,
 					simulcast, vport2, vport3, dosvc, dovskew,
 					rtpcollision ? json_integer_value(rtpcollision) : 0,
@@ -3588,6 +3596,31 @@ void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char 
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* FIXME We don't care about what the browser sends us, we're sendonly */
+	// JANUS_LOG(LOG_VERB, "incoming rtp len=%d"\n, len);
+	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;
+	if(!session || g_atomic_int_get(&session->destroyed) || session->stopping || !session->started || session->paused) {
+		JANUS_LOG(LOG_ERR, "session invalid");
+		return;
+	}
+	janus_streaming_mountpoint *mp = (janus_streaming_mountpoint *)session->mountpoint;
+	if(mp->streaming_source != janus_streaming_source_rtp)
+		return;
+	janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
+	janus_rtp_header *header = (janus_rtp_header *)buf;
+	guint32 timestamp = ntohl(header->timestamp);
+	guint16 seq = ntohs(header->seq_number);
+	JANUS_LOG(LOG_HUGE, "Incoming RTP packet (size=%d, seq=%"SCNu16", ts=%"SCNu32") sent to port %hu fd=%d\n",
+		len, seq, timestamp, mp->audiooutport, mp->audiooutfd);
+	int plen = 0;
+	char *payload = janus_rtp_payload(buf, len, &plen);
+
+	// mp->audiooutport;
+	int sent;
+	if((sent = sendto(mp->audiooutfd, buf, len, 0, &mp->audiooutaddr, sizeof(mp->audiooutaddr))) < 0) {
+		JANUS_LOG(LOG_ERR, "relaying incoming RTP failed\n");
+	} else {
+		JANUS_LOG(LOG_HUGE, "relayed: %d\n", sent);
+	}
 }
 
 void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
@@ -3945,7 +3978,7 @@ done:
 						mp->codecs.audio_pt, mp->codecs.audio_fmtp);
 					g_strlcat(sdptemp, buffer, 2048);
 				}
-				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
+				g_strlcat(sdptemp, "a=sendrecv\r\n", 2048);
 			}
 			if(mp->codecs.video_pt >= 0 && session->video) {
 				/* Add video line */
@@ -4507,7 +4540,7 @@ static void janus_streaming_file_source_free(janus_streaming_file_source *source
 janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		int srtpsuite, char *srtpcrypto, int threads,
-		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint16_t artcpport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
+		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint16_t artcpport, uint16_t artcoutport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
 		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint16_t vrtcpport, uint8_t vcodec, char *vrtpmap, char *vfmtp, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3, gboolean svc, gboolean dovskew, int rtp_collision,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg) {
@@ -4548,11 +4581,26 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		dovideo ? "enabled" : "NOT enabled",
 		dodata ? "enabled" : "NOT enabled");
 	/* First of all, let's check if the requested ports are free */
-	int audio_fd = -1;
+	int audio_fd = -1, audioout_fd = -1;
 	int audio_rtcp_fd = -1;
+	struct sockaddr_in audioout_addr;
 	if(doaudio) {
 		audio_fd = janus_streaming_create_fd(aport, amcast ? inet_addr(amcast) : INADDR_ANY, aiface,
 			"Audio", "audio", name ? name : tempname);
+
+		const char* localhost = "127.0.0.1";
+		in_addr_t localhost_addr = inet_addr(localhost);
+		audioout_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+		socklen_t addrlen = 0;
+		memset(&audioout_addr, 0, sizeof(audioout_addr));
+		audioout_addr.sin_family = AF_INET;
+		audioout_addr.sin_port = htons(artcoutport);
+		memcpy(&audioout_addr.sin_addr, &localhost_addr, sizeof(localhost_addr));
+		// remote = (struct sockaddr *)(&audioout_addr);
+		// addrlen = sizeof(audioout_addr);
+
+
 		if(audio_fd < 0) {
 			JANUS_LOG(LOG_ERR, "Can't bind to port %d for audio...\n", aport);
 			janus_mutex_unlock(&mountpoints_mutex);
@@ -4686,6 +4734,9 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 	live_rtp->enabled = TRUE;
 	live_rtp->active = FALSE;
 	live_rtp->audio = doaudio;
+	live_rtp->audiooutport = artcoutport;
+	live_rtp->audiooutfd = audioout_fd;
+	memcpy(&live_rtp->audiooutaddr, &audioout_addr, sizeof(audioout_addr));
 	live_rtp->video = dovideo;
 	live_rtp->data = dodata;
 	live_rtp->streaming_type = janus_streaming_type_live;
@@ -5520,7 +5571,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		janus_refcount_decrease(&live_rtsp->ref);	/* This is for the failed thread */
 		janus_refcount_decrease(&live_rtsp->ref);
 		return NULL;
-	}				
+	}
 	g_hash_table_insert(mountpoints, janus_uint64_dup(live_rtsp->id), live_rtsp);
 	janus_mutex_unlock(&mountpoints_mutex);
 	return live_rtsp;
@@ -5794,7 +5845,7 @@ static void *janus_streaming_filesource_thread(void *data) {
 	janus_refcount_decrease(&mountpoint->ref);
 	return NULL;
 }
-		
+
 /* Thread to relay RTP frames coming from gstreamer/ffmpeg/others */
 static void *janus_streaming_relay_thread(void *data) {
 	JANUS_LOG(LOG_VERB, "Starting streaming relay thread\n");

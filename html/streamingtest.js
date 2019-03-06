@@ -46,7 +46,7 @@ var server = null;
 if(window.location.protocol === 'http:')
 	server = "http://" + window.location.hostname + ":8088/janus";
 else
-	server = "https://" + window.location.hostname + ":8089/janus";
+	server = "https://" + window.location.hostname + "/janus";
 
 var janus = null;
 var streaming = null;
@@ -151,7 +151,7 @@ $(document).ready(function() {
 										streaming.createAnswer(
 											{
 												jsep: jsep,
-												media: { audioSend: false, videoSend: false },	// We want recvonly audio/video
+												media: { audioSend: true, videoSend: false },	// We want recvonly audio/video
 												success: function(jsep) {
 													Janus.debug("Got SDP!");
 													Janus.debug(jsep);
